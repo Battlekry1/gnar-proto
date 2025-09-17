@@ -1,5 +1,13 @@
 import React, { useEffect, useRef, useState } from "react";
 import * as THREE from "three";
+import { TrickQueue } from './game/TrickQueue';
+import { TrickFeed } from './game/TrickFeed';
+import { findBestSnap, seedRailSpeed, stepGrind } from './game/Rails';
+
+
+
+let currentRail: Rail | null = null;
+
 
 // GNAR prototype — stable build with press-to-grind (O), raised rails, kickflip/shove-it queue, labels, star, wedge
 export default function App() {
@@ -13,7 +21,11 @@ export default function App() {
 
 
   // ===== Build tag =====
-  const BUILD_TAG = "stable+rails+pressToGrind(O)+airborneAnyDir+raisedRails (2025-08-25 b28)";
+  const BUILD_TAG = "stable-rails-split-v1 (09-17-2025 b29)";
+
+  // TEMP: disable all point math / numeric HUD while rebuilding PointsV2
+  // Flip to false only after PointsV2 is implemented
+  const POINTS_DISABLED = true; // TODO[PointsV2]
 
   // ===== Tunables (with sliders) =====
   const [coastSpeed, setCoastSpeed] = useState(9.6);
@@ -26,6 +38,7 @@ export default function App() {
   const [spinRate, setSpinRate] = useState(6.0);   // rad/s for flatspin (A/D)
   const [flipSpeed, setFlipSpeed] = useState(16);     // was lower; default now 16
   const [shuvSpeed, setShuvSpeed] = useState(12.6);   // default 12.6
+  const [rollToleranceDeg, setRollToleranceDeg] = useState(20);
 
   // Rails tuning
   const [railSnapDist, setRailSnapDist] = useState(1.5);  // meters; default 1.50
@@ -52,18 +65,41 @@ const [panelVisible, setPanelVisible] = useState(true);
 const [entryBoost, setEntryBoost] = useState(0.6);         // extra m/s added on snap
 const [magnetTime, setMagnetTime] = useState(0.12);        // seconds to fully center on rail
 const [coyoteMs, setCoyoteMs] = useState(140);             // ms allowed after leaving ground to still snap
-let spacePressed = false;
+
   // --- End rails extras ---
 
+  const queue = React.useRef(new TrickQueue()).current;
+const feed  = React.useRef(new TrickFeed()).current;
 
   
   const [lastTrick, setLastTrick] = useState("");
   const [lastTrickPts, setLastTrickPts] = useState(0);
   const [trickTimer, setTrickTimer] = useState(0);
+    // Live trick string while in-air or grinding
+  const [comboPieces, setComboPieces] = React.useState<string[]>([]);
+
+  // Keep placeholder numeric state so renders never crash (noops while POINTS_DISABLED)
+  const [grindLivePts, setGrindLivePts] = React.useState(0);
   const [totalScore, setTotalScore] = useState(0);
   const [airPoints, setAirPoints] = useState(0);
   const [isAir, setIsAir] = useState(false);
   const [bailTimer, setBailTimer] = useState(0);
+  const [isGrinding, setIsGrinding] = useState(false);
+  const grindLiveRef = useRef(0);
+
+    // Live subtotal across the whole combo (air + grind + anything in between)
+  const comboLiveRef = React.useRef(0);
+
+    // Baseline captured at the start of the current segment (air or grind)
+const comboAnchorRef = React.useRef(0);
+
+
+  const [comboLive, setComboLive] = React.useState(0);
+
+  // live, in-flight trick list for Legacy HUD
+const comboPiecesRef = React.useRef<string[]>([]);
+const [comboTick, setComboTick] = React.useState(0); // bump to force re-render when list changes
+
 
   useEffect(() => { totalScoreRef.current = totalScore; }, [totalScore]);
 
@@ -364,8 +400,12 @@ let spacePressed = false;
     const trickQueue: { type: 'flip' | 'shuv'; remaining: number; dir: 1 | -1 }[] = [];
     const completedTricks: { name: string; points: number }[] = [];
 
+const pushPiece = (name: string) => {
+  comboPiecesRef.current.push(name);
+  setComboTick(t => t + 1);
+};
+
     // Grind state
-    let currentRail: Rail | null = null;
     let railT = 0;            // 0..1 along rail
     let railDir: 1 | -1 = 1;  // travel direction along t
     let grindDist = 0;        // meters traveled on rail (for scoring)
@@ -423,15 +463,27 @@ let spacePressed = false;
 
       // Queue tricks only when airborne and on initial K down
       if (e.code === 'KeyK' && !kDownLatch && state.current === 'airborne') {
-        kDownLatch = true;
-        if (keys.has('KeyA')) { // Kickflip
-          trickQueue.push({ type: 'flip', remaining: Math.PI * 2, dir: 1 });
-          spinLockTimer = 0.15;
-        } else if (keys.has('KeyS')) { // Shove-it 180
-          trickQueue.push({ type: 'shuv', remaining: Math.PI, dir: 1 });
-          spinLockTimer = 0.15;
-        }
-      }
+  kDownLatch = true;
+  const aHeld = keys.has('KeyA');  // spin key you often hold
+  const sHeld = keys.has('KeyS');  // shuv selector
+
+   if (sHeld && !aHeld) queue.enqueueShuv(1);
+  else if (aHeld && !sHeld) queue.enqueueFlip(1);
+
+  if (sHeld && !aHeld) {
+    // Shove-it 180
+    trickQueue.push({ type: 'shuv', remaining: Math.PI, dir: 1 });
+    spinLockTimer = 0.15;
+  } else if (aHeld && !sHeld) {
+    // Kickflip
+    trickQueue.push({ type: 'flip', remaining: Math.PI * 2, dir: 1 });
+    spinLockTimer = 0.15;
+  } else {
+    // both or neither held -> ignore to prevent accidental tricks
+    // (Optional) console.log('[TRICK] ignored: ambiguous or none');
+  }
+}
+
       // Press-to-grind on O (airborne only; ascending or descending allowed)
       if (e.code === 'KeyO') {
         if (state.current === 'airborne' || coyoteTimer > 0) {
@@ -466,9 +518,31 @@ let spacePressed = false;
         (window as any).lastAirborneAt = performance.now() * 0.001;
         coyoteTimer = coyoteMs / 1000; // <-- Add this line
         spinAngle = 0; airSpinAbs = 0; boardRollZ = 0; boardSpinY = 0; spinLockTimer = 0;
-        trickQueue.length = 0; completedTricks.length = 0;
-        setIsAir(true); setAirPoints(100);
+        trickQueue.length = 0;
+        completedTricks.length = 0;
+        setIsAir(true);
+        // ==== Trick system reset for a fresh air segment (Phase 1 split) ====
+        queue.clear();                  // no leftover queued tricks
+        completedTricks.length = 0;     // clear any completed names from last run
+        feed.resetWithOllie();          // start HUD with "Ollie"
+        setComboPieces([...feed.list]);      // update the names on screen
+
+        if (!POINTS_DISABLED) {
+          setAirPoints(100);
+          comboAnchorRef.current = comboLiveRef.current;
+          setComboLive(comboAnchorRef.current + 100); // start at +100 like before
+        } else {
+          // names-only flow
+          comboAnchorRef.current = 0;
+          setComboLive(0);
+        }
+        setIsGrinding(false);
+        comboLiveRef.current = 0;
+        setComboLive(0);
+        setComboPieces(["Ollie"]);
         setTrickTimer(0); setBailTimer(0);
+        comboPiecesRef.current = ['Ollie'];
+        setComboTick(t => t + 1);
       }
       wasSpace = pushing;
 
@@ -521,88 +595,54 @@ let spacePressed = false;
 
 // ---- Press-to-grind snap (robust, no new state required) ----
 function trySnapToRail(): boolean {
-  // Use railMagnetTime / railCoyoteMs if they exist; else fall back.
-  // @ts-ignore
-  const lookaheadTime: number = (typeof railMagnetTime === 'number' ? railMagnetTime : 0.12);
-  // @ts-ignore
-  const coyoteSec: number = (typeof railCoyoteMs === 'number' ? railCoyoteMs / 1000 : 0);
-
-  // For now: snap only while airborne (we can wire coyote later when we track last grounded time)
   if (state.current !== 'airborne') return false;
 
-  // Predict a little ahead along current horizontal velocity to create the "magnet" feel
+  // lookahead time: use your existing railMagnetTime (fallback to 0.12s)
+  const lookahead = typeof railMagnetTime === 'number' ? railMagnetTime : 0.12;
+
   const posNow = boardRoot.position.clone();
-  const velFlatSnap = v.clone(); velFlatSnap.y = 0;
-  const posSoon = posNow.clone().add(velFlatSnap.clone().multiplyScalar(Math.max(0, lookaheadTime)));
+  const velFlat = v.clone(); velFlat.y = 0;
 
-  let best: { rail: Rail; t: number; q: THREE.Vector3; dist: number } | null = null;
-  const considerPositions = [posSoon, posNow]; // prefer future position, then fallback to current
+  const snap = findBestSnap(
+    rails, posNow, velFlat, yaw,
+    railSnapDist, y, lookahead
+  );
+  if (!snap) return false;
 
-  for (const rail of rails) {
-    for (const p of considerPositions) {
-      const { q, t } = rail.closest(p);
+  // Apply snap
+  currentRail = snap.rail;
+  railT = snap.t;
+  railDir = snap.dir;
+  grindDist = 0;
 
-      // Vertical window around rail top
-      const railTopY = rail.mesh.position.y + 0.03;
-      const verticalOff = (y - railTopY);
-      // Very forgiving: allow a decent window above/below
-      if (verticalOff < -0.6 || verticalOff > 1.0) continue;
+  const yRail = currentRail.mesh.position.y + 0.03;
+  boardRoot.position.set(snap.q.x, yRail, snap.q.z);
 
-      // Horizontal closeness
-      const horizP = new THREE.Vector3(p.x, railTopY, p.z);
-      const target = new THREE.Vector3(q.x, railTopY, q.z);
-      const dist = horizP.distanceTo(target);
-      if (dist > railSnapDist) continue;
+  // Heading and speed
+  yaw = Math.atan2(snap.chosenTan.x, snap.chosenTan.z);
+  const entrySpeed = Math.max(v.length(), coastSpeed * 0.7);
+  v.copy(snap.chosenTan).setLength(entrySpeed);
+  railSpeedRef.current = seedRailSpeed(entrySpeed, 4.0, 1.08);
 
-      if (!best || dist < best.dist) best = { rail, t, q, dist };
-    }
-  }
+  // reset trick visuals for grind phase
+  yVel = 0;
+  spinAngle = 0; airSpinAbs = 0; boardRollZ = 0; boardSpinY = 0; spinLockTimer = 0;
+  trickQueue.length = 0;
 
-  if (!best) return false;
+  setIsAir(false);
+  setIsGrinding(true);
+  state.current = 'grind';
 
-  // Base (constructor) tangent = (end - start).normalize()
-const baseTan = best.rail.tangent.clone().normalize();
+  // Show the name once
+  feed.addUnique('50-50');
+  setComboPieces([...feed.list]);
 
-// Decide grind direction: align to approach so it never spits you backwards
-const facing = forwardFromYaw(yaw);
-const velFlatApproach = v.clone().setY(0);
-const approach = velFlatApproach.lengthSq() > 1e-6 ? velFlatApproach.clone().normalize() : facing.clone();
+  // zero live grind readout
+  setGrindLivePts(0);
+  grindLiveRef.current = 0;
 
-let chosenTan = baseTan.clone();
-if (chosenTan.dot(approach) < 0) chosenTan.multiplyScalar(-1);
-
-// >>> CRITICAL: set railDir relative to the *base* tangent, not the flipped one.
-railDir = (chosenTan.dot(baseTan) >= 0) ? 1 : -1;
-
-currentRail = best.rail;
-railT = best.t;
-grindDist = 0;
-
-const yRail = currentRail.mesh.position.y + 0.03;
-boardRoot.position.set(best.q.x, yRail, best.q.z);
-
-// Heading and speed: along chosenTan
-yaw = Math.atan2(chosenTan.x, chosenTan.z);
-const entrySpeed = Math.max(v.length(), coastSpeed * 0.7);
-v.copy(chosenTan).setLength(entrySpeed);
-
-// Clear air trick visuals; lock into grind
-yVel = 0;
-spinAngle = 0; airSpinAbs = 0; boardRollZ = 0; boardSpinY = 0; spinLockTimer = 0;
-trickQueue.length = 0; completedTricks.length = 0;
-setIsAir(false);
-
-state.current = 'grind';
-
-// Seed rail speed from current ground/air speed with a tiny entry boost
-const entry = v.length();
-const minRail = 4.0;        // small floor so a slow snap still moves
-const entryBoost = 1.08;    // subtle "lock-in" boost
-railSpeedRef.current = Math.max(minRail, entry * entryBoost);
-
-return true;
+  return true;
 }
-
 
     function updateMovement(dt: number) {
       const forward = forwardFromYaw(yaw);
@@ -657,82 +697,62 @@ return true;
         state.current = 'airborne';
         (window as any).lastAirborneAt = performance.now() * 0.001;
         spinAngle = 0; airSpinAbs = 0; boardRollZ = 0; boardSpinY = 0; spinLockTimer = 0;
-        trickQueue.length = 0; completedTricks.length = 0;
-        setIsAir(true); setAirPoints(100);
+        setIsAir(true);
+        if (!POINTS_DISABLED) setAirPoints(100);
       }
       onRampPrev = onRamp;
 
       // ===== GRIND =====
       if (state.current === 'grind' && currentRail) {
-      // Use explicit rail speed scalar (independent of v)
-const signed = railSpeedRef.current * (railDir === 1 ? 1 : -1);
-const ds = signed * dt;
-grindDist += Math.abs(ds);
-railT += (ds / currentRail.len);
+  const { ds, newSpeed, newT, clampedT, posOnRail, newYaw, atEnd } =
+    stepGrind(currentRail, railDir, railSpeedRef.current, railFriction, dt, railT);
 
-// Apply friction to rail speed (exponential-ish)
-const f = Math.max(0, 1 - (1 - railFriction) * dt);
-railSpeedRef.current = Math.max(0, railSpeedRef.current * f);
+  // Accumulate distance
+  grindDist += Math.abs(ds);
 
-// Keep v for HUD/UI aligned to rail tangent (not used for advancing)
-v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1 ? 1 : -1));
+  // Update state from step
+  railSpeedRef.current = newSpeed;
+  railT = newT;
 
-        // Position & orientation from clamped t
-        const ab = currentRail.end.clone().sub(currentRail.start);
-        const clampedT = THREE.MathUtils.clamp(railT, 0, 1);
-        const posOnRail = currentRail.start.clone().addScaledVector(ab, clampedT);
-        boardRoot.position.set(posOnRail.x, currentRail.mesh.position.y + 0.03, posOnRail.z);
+  // Apply pose
+  boardRoot.position.set(posOnRail.x, currentRail.mesh.position.y + 0.03, posOnRail.z);
+  yaw = newYaw;
+  boardRoot.rotation.y = yaw;
+  y = boardRoot.position.y; yVel = 0;
 
-        // Yaw faces along tangent, plus 180° if railDir is -1 (so visuals match travel)
-        const baseTan = currentRail.tangent.clone().normalize();
-        yaw = Math.atan2(baseTan.x, baseTan.z) + (railDir === -1 ? Math.PI : 0);
-        boardRoot.rotation.y = yaw;
+  // Zero local rotations while grinding
+  riderGroup.rotation.set(0, 0, 0);
+  boardVisual.rotation.set(0, 0, 0);
 
-        y = boardRoot.position.y; yVel = 0;
+  // Exit logic (spacePressed or atEnd)
+  const pushing = keys.has('Space');
+  if (spacePressed || atEnd) {
+    const exitSpeed = railSpeedRef.current;
+    const dir = (railDir === 1 ? 1 : -1);
+    v.copy(currentRail.tangent).multiplyScalar(exitSpeed * dir);
+    carrySpeedRef.current = exitSpeed;
 
-        // zero rider/board local rotations while grinding
-        riderGroup.rotation.set(0, 0, 0);
-        boardVisual.rotation.set(0, 0, 0);
+    // Pop to air (unchanged)
+    const popped = (spacePressed === true);
+    yVel = popped ? (params.ollieVel * 0.6) : 0.0;
+    state.current = 'airborne';
+    setIsAir(true);
+    currentRail = null;
+    airCarryTimer.current = 0.35;
 
-        // Exit (space release or end of rail)
-        const pushing = keys.has('Space');
-        const atEnd = (railT <= 0 && railDir === -1) || (railT >= 1 && railDir === 1);
-        if (spacePressed || atEnd) {
-          // Carry exact rail speed into the air and align velocity to rail direction
-          const exitSpeed = railSpeedRef.current;
-          const dir = (railDir === 1 ? 1 : -1);
-          v.copy(currentRail.tangent).multiplyScalar(exitSpeed * dir);
-          carrySpeedRef.current = exitSpeed;
-          
-          // Pop and enter airborne; lock horizontal speed for a short window
-          yVel = params.ollieVel * 0.6;
-          state.current = 'airborne';
-          currentRail = null;
-          
-          airCarryTimer.current = 0.35;  // lock horizontal speed for this many seconds
-          
-          setIsAir(true);
-          setAirPoints(100);
-          
-          // Score this grind
-          const pts = 100 + Math.floor(grindDist * 50);
-          setLastTrick('50-50 Grind');
-          setLastTrickPts(pts);
-          setTrickTimer(1.6);
-          setTotalScore(prev => prev + pts);
-          grindDist = 0;
-          
-          spacePressed = false; // reset
-          return;
-          setTrickTimer(1.6);
-          setTotalScore(prev => prev + pts);
-          grindDist = 0;
+    if (!POINTS_DISABLED) setAirPoints(100);
 
-          spacePressed = false; // reset
-          return;
-        }
-        return;
-      }
+    // Names-only on exit: (we already stopped adding 50-50 here)
+    // completedTricks.push({ name: '50-50', points: 0 }); // keep if you want it in landing banner
+
+    // Record grind for landing banner (names-only while points are off)
+completedTricks.push({ name: '50-50', points: 0 });
+
+    grindDist = 0;
+    spacePressed = false;
+    return;
+  }
+}
 
       if (state.current === 'airborne') {
                 // Lock horizontal speed during carry window so we don't snap down/up mid-air
@@ -744,29 +764,27 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
           }
         }
         
-        // trick queue execution
-        if (trickQueue.length > 0) {
-          const t = trickQueue[0];
-          if (t.type === 'flip') {
-            const step = flipSpeed * dt * t.dir;
-            t.remaining = Math.max(0, t.remaining - Math.abs(step));
-            boardRollZ += step;
-            if (t.remaining <= 1e-4) {
-              boardRollZ = Math.round(boardRollZ / (2*Math.PI)) * 2*Math.PI;
-              completedTricks.push({ name: 'Kickflip', points: 150 });
-              trickQueue.shift();
-            }
-          } else {
-            const step = shuvSpeed * dt * t.dir;
-            t.remaining = Math.max(0, t.remaining - Math.abs(step));
-            boardSpinY += step;
-            if (t.remaining <= 1e-4) {
-              boardSpinY = Math.round(boardSpinY / Math.PI) * Math.PI;
-              completedTricks.push({ name: 'Shove-it', points: 180 });
-              trickQueue.shift();
-            }
-          }
-        }
+        // --- Trick queue execution (visual + completion) ---
+
+  const { dRollZ, dSpinY, completed } = queue.tick(dt, flipSpeed, shuvSpeed);
+
+  // Apply the per-frame visuals
+  boardRollZ += dRollZ;
+  boardSpinY += dSpinY;
+
+  // If something just finished, snap angles cleanly and update names
+  if (completed) {
+    if (completed.name === 'Kickflip') {
+      // snap roll to full turns of 2π so you land clean visually
+      boardRollZ = Math.round(boardRollZ / (2 * Math.PI)) * (2 * Math.PI);
+    } else if (completed.name === 'Shove-it') {
+      // snap spin to half-turns of π
+      boardSpinY = Math.round(boardSpinY / Math.PI) * Math.PI;
+    }
+    completedTricks.push(completed);
+    feed.addUnique(completed.name);
+    setComboPieces([...feed.list]);
+  }
 
         // Flatspin (A/D)
         spinLockTimer = Math.max(0, spinLockTimer - dt);
@@ -774,11 +792,18 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
         const dSpin = spinRate * dt * spinInput;
         spinAngle += dSpin; airSpinAbs += Math.abs(dSpin);
 
-        // live points
+        // Live “air” value = base 100 + spin + any completed flip/shuv already finished mid-air
         const spinDegAbs = airSpinAbs * 180 / Math.PI;
-        const livePts = 100 + Math.floor(spinDegAbs);
-        if (!isAir) setIsAir(true);
-        setAirPoints(livePts);
+        if (!POINTS_DISABLED) {
+          const airCompleted = completedTricks.reduce((s, t) => s + (t.points || 0), 0);
+          const liveAir = 100 + Math.floor(spinDegAbs) + airCompleted;
+          setAirPoints(liveAir);
+          setComboLive(comboLiveRef.current + liveAir);
+        } else {
+          // keep numeric live air at zero to avoid NaN/UI noise
+          setAirPoints(0);
+          setComboLive(comboAnchorRef.current || 0);
+        }
 
         // vertical
         yVel -= params.g * dt; y += yVel * dt;
@@ -786,11 +811,15 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
           y = 0.03; yVel = 0.0;
           const landingSpeed = v.length();
           if (landingSpeed > 0.1) {
-            const epsRoll = THREE.MathUtils.degToRad(2.0);
-            const epsShuv = THREE.MathUtils.degToRad(3.0);
-            const rollDone = nearlyMultiple(boardRollZ, 2*Math.PI, epsRoll);
-            const shuvDone = nearlyMultiple(boardSpinY, Math.PI, epsShuv);
-            const tricksInProgress = trickQueue.length > 0 || !rollDone || !shuvDone;
+            // Queue-based progress: if queue still has an item, trick is not finished
+const tricksInProgress = !queue.isEmpty();
+
+// Snap to clean angles once tricks are done so small residuals don't cause bail
+if (!tricksInProgress) {
+  boardRollZ = Math.round(boardRollZ / (2*Math.PI)) * (2*Math.PI);
+  boardSpinY = Math.round(boardSpinY / Math.PI) * Math.PI;
+}
+
 
             const facingYaw = yaw + spinAngle;
             const facing = new THREE.Vector3(Math.sin(facingYaw), 0, Math.cos(facingYaw)).normalize();
@@ -802,20 +831,72 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
             const rollOk = Math.abs(THREE.MathUtils.radToDeg(wrapAngle(boardRollZ))) <= 15;
 
             if (!tricksInProgress && rollOk && (okForward || okBackward)) {
-              const spinDegQuant = Math.round((airSpinAbs * 180 / Math.PI) / 180) * 180;
-              const baseName = spinDegQuant === 0 ? 'Ollie' : `${spinDegQuant} Ollie`;
-              let trickPoints = 100 + Math.floor(airSpinAbs * 180 / Math.PI);
-              const compNames = completedTricks.map(t => t.name);
-              for (const t of completedTricks) trickPoints += t.points;
-              const name = completedTricks.length ? `${compNames.join(' + ')} + ${baseName}` : baseName;
-              setLastTrick(name); setLastTrickPts(trickPoints); setTrickTimer(1.6);
-              setTotalScore(prev => prev + trickPoints);
-              state.current = 'coasting';
+              // Quantize the spin to “0 / 180 / 360 …” names, but score the actual spin
+            const spinDegAbs = airSpinAbs * 180 / Math.PI;
+            const spinDegQuant = Math.round(spinDegAbs / 180) * 180;
+            const baseName = spinDegQuant === 0 ? 'Ollie' : `${spinDegQuant} Ollie`;
+
+            // Names: show in the order they happened (Ollie first, then flips/shuvs, etc.)
+            const names = [baseName, ...completedTricks.map(t => t.name)];
+            const finalName = names.join(' + ');
+
+            // Commit the banner name
+            setLastTrick(finalName);
+
+            if (!POINTS_DISABLED) {
+              // Points: 100 base + spin degrees (rounded down) + every completed trick’s points
+              const finalPoints =
+              100 +
+              Math.floor(spinDegAbs) +
+              completedTricks.reduce((sum, t) => sum + (t.points || 0), 0);
+
+              // Bank the full combo: prior baseline + this segment
+              const bank = comboLiveRef.current + finalPoints;
+              const safeBank = Number.isFinite(bank) ? bank : 0;
+              setLastTrickPts(safeBank);
+              setTrickTimer(1.6);
+              setTotalScore(prev => prev + safeBank);
+            } else {
+              // Points disabled: show names only, zero the numeric banner
+              setLastTrickPts(0);
+              setTrickTimer(1.6);
+            }
+            
+            // Reset combo state for next run (names/visuals preserved, numeric cleared)
+            comboLiveRef.current = 0;
+            comboAnchorRef.current = 0;
+            setComboLive(0);
+            setIsGrinding(false);
+            completedTricks.length = 0;
+            comboPiecesRef.current = [];
+            setComboTick(t => t + 1);
+            comboLiveRef.current = 0;
+            comboAnchorRef.current = 0;
+            setComboLive(0);
+            setIsGrinding(false);
+
+            // Clean up + exit air
+            state.current = 'coasting';
+
               spinAngle = 0; airSpinAbs = 0; boardRollZ = 0; boardSpinY = 0; spinLockTimer = 0;
               capMat.color.set(0xff914d);
               setBailTimer(0);
             } else {
               setTrickTimer(0); setBailTimer(1.0); state.current = 'bail';
+              // Hard reset tricks on bail (prevents carry-over into next run)
+trickQueue.length = 0;
+completedTricks.length = 0;
+comboPiecesRef.current = [];
+
+setComboTick(t => t + 1);
+kDownLatch = false;
+
+              comboLiveRef.current = 0;
+              comboAnchorRef.current = 0;
+              setComboLive(0);
+              setIsGrinding(false);
+              comboPiecesRef.current = [];
+              setComboTick(t => t + 1);
               capMat.color.set(0xff2222);
               riderGroup.rotation.set(Math.PI/2, 0, 0);
             }
@@ -825,6 +906,15 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
             setTrickTimer(0); setBailTimer(0);
           }
           setIsAir(false);
+          // Note: post-landing carry disabled in Points-disabled mode to avoid double-counting
+          if (!POINTS_DISABLED) {
+            const airCompleted = completedTricks.reduce((s, t) => s + (t.points || 0), 0);
+            const liveAir = 100 + Math.floor(airSpinAbs * 180 / Math.PI) + airCompleted;
+            comboLiveRef.current += liveAir;
+            setComboLive(comboLiveRef.current);
+          } else {
+            setComboLive(0);
+          }
         }
       }
 
@@ -833,7 +923,18 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
         const speed = v.length();
         const ns = approach(speed, 0, params.accel, dt);
         if (ns === 0) v.set(0,0,0); else v.setLength(ns);
-        if (ns === 0) { state.current = 'idle'; capMat.color.set(0xff914d); riderGroup.rotation.set(0,0,0); }
+        if (ns === 0) {
+  // Safety: ensure nothing lingers after bail fully stops
+  queue.clear();
+  completedTricks.length = 0;
+  
+  setComboPieces([...feed.list]);
+  state.current = 'idle';
+  capMat.color.set(0xff914d);
+  riderGroup.rotation.set(0,0,0);
+}
+
+
       }
 
       if (state.current !== 'grind') {
@@ -877,7 +978,9 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
       if (distSq < pickRadius * pickRadius) {
         starAlive = false; star.visible = false;
         sparkles.push(new Sparkle(scene, star.position.clone()));
-        popups.push(new ScorePopup(scene, star.position.clone()));
+        if (!POINTS_DISABLED) {
+          popups.push(new ScorePopup(scene, star.position.clone()));
+        }
         starsCountRef.current += 1; setStarsCollected(prev => prev + 1);
         if (typeof (window as any).onCollectSound === 'function') (window as any).onCollectSound();
         setTimeout(respawnStar, 700);
@@ -898,9 +1001,7 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
         `STATE: <b>${state.current}</b> &nbsp;|&nbsp; ` +
         `SPEED: ${speed.toFixed(2)} m/s &nbsp;|&nbsp; ` +
         `HEADING: ${comp.label} ${comp.deg}° &nbsp;|&nbsp; ` +
-        `⭐ Stars: ${starsCountRef.current} &nbsp;|&nbsp; ` +
-        `Score: ${totalScore}`;
-         `Score: ${totalScoreRef.current}`;
+        `⭐ Stars: ${starsCountRef.current}` + (POINTS_DISABLED ? '' : ` &nbsp;|&nbsp; Score: ${totalScore}`);
     }
 
     // ---------- Main loop ----------
@@ -946,7 +1047,7 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
   coastSpeed, chargeSpeed, turnRateIdle, turnRateCoast, turnRateCharge, tileRepeat,
   spinRate, flipSpeed, shuvSpeed,
   railSnapDist, railSnapAngleDeg, railFriction,
-  railMagnetTime, railCoyoteMs, spacePressed = false
+    railMagnetTime, railCoyoteMs
 ]);
 
   // ---------- UI ----------
@@ -987,22 +1088,28 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
         }}
       />
 
-      {/* Trick label bottom-center */}
+            {/* Trick label bottom-center */}
       <div style={{
         position: "fixed", bottom: 64, left: "50%", transform: "translateX(-50%)",
         textAlign: "center", color: "#fff", fontWeight: 700, userSelect: "none", zIndex: 10
       }}>
-        {isAir ? (
+        {(isAir || currentRail) ? (
           <div>
-            <div style={{ fontSize: 20 }}>Ollie</div>
-            <div style={{ fontSize: 18 }}>+{airPoints}</div>
+            <div style={{ fontSize: 20 }}>
+              {comboPieces.length ? comboPieces.join(" + ") : "Ollie"}
+            </div>
+            { !POINTS_DISABLED ? (
+              <div style={{ fontSize: 18 }}>
+                +{ currentRail ? grindLivePts : airPoints }
+              </div>
+            ) : null }
           </div>
         ) : (
           <div style={{ opacity: trickOpacity }}>
             {showTrick && (
               <div>
                 <div style={{ fontSize: 20 }}>{lastTrick}</div>
-                <div style={{ fontSize: 18 }}>+{lastTrickPts}</div>
+                <div style={{ fontSize: 18 }}>+{ Number.isFinite(lastTrickPts) ? lastTrickPts : 0 }</div>
               </div>
             )}
           </div>
@@ -1045,7 +1152,7 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
           {/* Body */}
           {activeTab === "Movement" && (
             <div>
-              <Labeled label={`Coast Speed: ${coastSpeed.toFixed(1)} m/s`}>
+              <Labeled label={`Coast Speed: ${coastSpeed.toFixed(1)} m/s`}> 
                 <input type="range" min="0.5" max="15" step="0.1"
                   value={coastSpeed} onChange={e=>setCoastSpeed(parseFloat(e.target.value))} />
               </Labeled>
@@ -1130,7 +1237,7 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
     max="3.0"
     step="0.05"
     value={railSnapDist}
-    onChange={e => setRailSnapDist(parseFloat(e.target.value))}
+    onChange={e=>setRailSnapDist(parseFloat(e.target.value))}
   />
 </div>
 
@@ -1144,7 +1251,7 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
     max="1.5"
     step="0.01"
     value={railMagnetTime}
-    onChange={e => setRailMagnetTime(parseFloat(e.target.value))}
+    onChange={e=>setRailMagnetTime(parseFloat(e.target.value))}
   />
 </div>
 
@@ -1158,7 +1265,7 @@ v.copy(currentRail.tangent).multiplyScalar(railSpeedRef.current * (railDir === 1
     max="1.0"
     step="0.01"
     value={railCoyoteTime}
-    onChange={e => setRailCoyoteTime(parseFloat(e.target.value))}
+    onChange={e=>setRailCoyoteTime(parseFloat(e.target.value))}
   />
 </div>
             </div>
